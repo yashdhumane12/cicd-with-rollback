@@ -1,0 +1,127 @@
+name: CI/CD with Rollback
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/cicd-rollback-app
+  CONTAINER_NAME: rollback-app
+
+jobs:
+  # ── 1. Test ──────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Run pytest
+        run: pytest app/test_app.py -v
+
+  # ── 2. Build & Push ──────────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get short SHA tag
+        id: tag
+        run: echo "tag=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+
+  # ── 3. Deploy with health check + rollback ───────────────────────────
+  deploy:
+    name: Deploy + Health Check + Rollback
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record previous version
+        id: previous
+        run: |
+          PREV=$(docker inspect --format='{{.Config.Image}}' ${{ env.CONTAINER_NAME }} 2>/dev/null || echo "none")
+          echo "image=$PREV" >> $GITHUB_OUTPUT
+
+      - name: Deploy new version
+        run: |
+          docker pull ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+          docker stop ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker rm   ${{ env.CONTAINER_NAME }} 2>/dev/null || true
+          docker run -d \
+            --name ${{ env.CONTAINER_NAME }} \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            -e APP_VERSION=${{ needs.build.outputs.image_tag }} \
+            ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}
+
+      - name: Health check (30s window, 6 retries)
+        id: healthcheck
+        run: |
+          echo "Waiting for app to start..."
+          sleep 10
+          for i in $(seq 1 6); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/health || echo "000")
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Health check FAILED after 6 attempts"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          PREV_IMAGE="${{ steps.previous.outputs.image }}"
+          echo "Rolling back to: $PREV_IMAGE"
+          if [ "$PREV_IMAGE" = "none" ]; then
+            echo "No previous version to rollback to — stopping container"
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            exit 1
+          fi
+          docker stop ${{ env.CONTAINER_NAME }} || true
+          docker rm   ${{ env.CONTAINER_NAME }} || true
+          docker run -d \
+            --name ${{ env.CONTAINER_NAME }} \
+            --restart unless-stopped \
+            -p 5000:5000 \
+            "$PREV_IMAGE"
+          echo "Rollback complete to $PREV_IMAGE"
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "Deployment successful!"
+          echo "  Version: ${{ needs.build.outputs.image_tag }}"
+          echo "  Image:   ${{ env.IMAGE }}:${{ needs.build.outputs.image_tag }}"
